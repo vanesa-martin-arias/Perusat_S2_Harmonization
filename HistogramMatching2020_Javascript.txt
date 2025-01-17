@@ -1,0 +1,159 @@
+var perusat2020 = ee.Image('projects/servir-sco-assets/assets/PeruSat-1_L8_L9_S2_Harmonization/ATCOR_ORTO_DIM_PER1_20200804151918_SEN_MS_001290');
+var s2img2020 = ee.Image('projects/servir-sco-assets/assets/PeruSat-1_L8_L9_S2_Harmonization/s2img_2020')
+
+
+Map.setCenter(-74.9484, -8.1118, 12)
+//Map.addLayer(AOI, {}, 'AOI')
+
+//SENTINEL-2
+// var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+// var S2_2A_date = s2.filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', 35).filterDate('2023-09-20', '2023-09-25').filterBounds(perusat_geometry);
+var s2bands_og = ['B2','B3','B4','B8']
+var s2bands = ['b1','b2','b3','b4']
+
+var perusat_geometry = perusat2020.geometry()
+Map.addLayer(perusat_geometry, {}, 'perusat geometry')
+var s2_clip = s2img2020.clip(perusat_geometry)
+print(s2_clip, 's2 2020 clip')
+Map.addLayer(s2_clip, {}, 's2 2020 clip', 1)
+
+//Perusat-1
+var ps_ = perusat2020.reproject('EPSG:4326', null, 10);
+var psbands_og = ['b1','b2','b3','b4']
+var ps = ps_.select(psbands_og)
+print(ps, 'perusat new bands')
+// Map.addLayer(ps, {}, 'perusat', 1)
+
+////////////////////////////////////////CHART OF BANDS/////////////////////////////////////////////////
+var s2_= s2_clip.reproject('EPSG:4326', null, 10);
+var s2_19 = s2_.select(s2bands_og,s2bands)
+var comb_ = ee.Image.cat([s2_19,ps])
+var comb = comb_.select('b1', 'b2', 'b3', 'b4', 'b1_1', 'b2_1', 'b3_1', 'b4_1').rename('b1', 'b2', 'b3', 'b4', 'b1_PS', 'b2_PS', 'b3_PS', 'b4_PS')
+//var comb_MS = comb.select(['b1','b2','b3','b4']);
+print(comb, 'combined image with all the bands');
+
+var chartStyle = {
+  title: ' Frequency (number of pixels with a band value in the bucket)',
+  colors: ['#0000FF','#89CFF0', '#2E8B57', '#93C572', '#D2042D', '#C04000', '#BF40BF', '#CCCCFF']
+};
+
+var chart = 
+   ui.Chart.image
+        .histogram({
+          image: comb, 
+          region: perusat_geometry,
+          scale: 10,
+          maxPixels: 1e13
+      });
+
+chart.setOptions(chartStyle);
+print(chart)
+////////////////////////////////////////HISTOGRAM MATCHING/////////////////////////////////////////////////
+var bands = ['b1','b2','b3','b4']
+var image1 = s2_19
+var image2 = ps
+
+// Get a FeatureCollection representation of a cumulative distribution function built from a histogram.  The returned FeatureCollection
+// can be used to train a classifer.
+//FUNCTION
+var getFC = function(image, band) {
+  // Histogram equalization start:
+  var histo = image.reduceRegion({
+    reducer: ee.Reducer.histogram({
+      maxBuckets: Math.pow(2, 12), 
+      minBucketWidth: 16, 
+      // maxRaw: 
+    }), 
+    geometry: image.geometry(), 
+    scale: 2, 
+    maxPixels: 1e12, 
+    tileScale: 8
+  });
+  //print(histo);
+  
+  var valsList = ee.List(ee.Dictionary(histo.get(band)).get('bucketMeans'));
+  var freqsList = ee.List(ee.Dictionary(histo.get(band)).get('histogram'));
+  var cdfArray = ee.Array(freqsList).accum(0);
+  var total = cdfArray.get([-1]);
+  var normalizedCdf = cdfArray.divide(total);
+  
+  // var chart = Chart.array.values(normalizedCdf, 0, valsList);
+  // print(chart); // OK
+  
+  var array = ee.Array.cat([valsList, normalizedCdf], 1);
+
+  return ee.FeatureCollection(array.toList().map(function(list) {
+    return ee.Feature(null, {
+      dn: ee.List(list).get(0), 
+      probability: ee.List(list).get(1)});
+  }));
+};
+
+//FUNCTION
+// Equalize a given band between two images.  Image1 is golden.
+var equalize = function(image1, image2, band) {
+  var fc1 = getFC(image1, band);
+  var fc2 = getFC(image2, band);
+      
+  var classifier1 = ee.Classifier.smileRandomForest(100)
+    .setOutputMode('REGRESSION')
+    .train({
+      features: fc1, 
+      classProperty: 'dn', 
+      inputProperties: ['probability']
+  });
+// var test = fc1.classify(classifier1);
+  // var testChart = Chart.feature.byFeature(test, 'probability', ['dn', 'classification']);
+  // print(testChart); // OK
+  
+  var classifier2 = ee.Classifier.smileRandomForest(100)
+  .setOutputMode('REGRESSION')
+  .train({
+    features: fc2, 
+    classProperty: 'probability', 
+    inputProperties: ['dn']
+  });
+
+  // Do the shuffle: DN -> probability -> DN. Return the result.
+  var b = image2.select(band).rename('dn');
+  return b
+    .classify(classifier2, 'probability') // DN -> probability
+    .classify(classifier1, band); // probability -> DN
+};
+
+// Map the matching function over each band.
+var match = function(image1, image2) {
+  return ee.Image.cat(bands.map(function(band) {
+    return equalize(image1, image2, band);
+  }));
+};
+
+var matched = match(image1, image2);
+
+Map.centerObject(image1);
+Map.addLayer(image1, {bands: ['b3','b2','b1'], min:200, max:4000},'img-default-s2');
+Map.addLayer(image2, {bands: ['b3','b2','b1'], min:200, max:4000},'to be matched-ps');
+Map.addLayer(matched, {bands: ['b3','b2','b1'], min:200, max:4000}, 'matched');
+////////////////////////chart after matching
+var ps_matched = matched.reproject('EPSG:4326', null, 10);
+var comb_m = ee.Image.cat([s2_19,ps_matched])
+var comb_mb = comb_m.select('b1', 'b2', 'b3', 'b4', 'b1_1', 'b2_1', 'b3_1', 'b4_1').rename('b1', 'b2', 'b3', 'b4', 'b1_PS', 'b2_PS', 'b3_PS', 'b4_PS')
+//var comb_MS = comb.select(['b1','b2','b3','b4']);
+print(comb_mb, 'combined image with all the bands');
+
+var chartStyle1 = {
+  title: ' Frequency (number of pixels with a band value in the bucket) after matching',
+  colors: ['#0000FF','#89CFF0', '#2E8B57', '#93C572', '#D2042D', '#C04000', '#BF40BF', '#CCCCFF']
+};
+
+var chart1 = 
+   ui.Chart.image
+        .histogram({
+          image: comb_mb, 
+          region: perusat_geometry,
+          scale: 10,
+          maxPixels: 1e13
+      });
+
+chart1.setOptions(chartStyle1);
+print(chart1)
