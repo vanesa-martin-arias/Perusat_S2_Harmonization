@@ -1,0 +1,135 @@
+// Last updated: 11.19.2024 modifi
+var perusat_geometry = ee.Geometry.Polygon(
+-75.02202399319583,-8.149775716074409,
+-74.89259131497317,-8.176963230858934,
+-74.86512549466067,-8.051885407633481,
+-74.99490149563724,-8.024689443490146
+)
+
+/////////////////////////////////////////DATA PREPARATION///////////////////////////////////////////////
+//SENTINEL-2
+var visParams = {
+    bands: ['b3', 'b2', 'b1'], // RGB natural
+    min: 0,
+    max: 3000
+  };
+//sentinel cargado desde el servicio de servir
+var s2_=ee.Image('projects/servir-sco-assets/assets/PeruSat-1_L8_L9_S2_Harmonization/s2img_2019')
+var s2bands_og = ['B2','B3','B4','B8']
+var s2bands = ['b1','b2','b3','b4']
+var s2 = s2_.select(s2bands_og,s2bands)
+print(s2, 'Sentinel new bands')
+Map.addLayer(s2,visParams,'S2_20190908')
+//Perusat-1
+var visParamsPS = {
+    bands: ['b3', 'b2', 'b1'], // RGB natural
+    min: 0,
+    max: 3000
+  };
+
+//Perusat-1
+var perusat_2019_1 = ee.Image('projects/ee-perudeforestation/assets/ATCOR_ORTO_DIM_PER1_20190915151221_SEN_MS_000054')
+var perusat_2019_2 = ee.Image('projects/ee-perudeforestation/assets/ATCOR_ORTO_DIM_PER1_20190915151221_SEN_MS_000372')
+//var ps_ = ee.Image('projects/servir-sco-assets/assets/PeruSat-1_L8_L9_S2_Harmonization/PSH_DIM_PER1_20230922151914_SEN_P_009942-012')
+var psbands_og = ['b1','b2','b3','b4']
+var ps1 = perusat_2019_1.select(psbands_og);
+var ps2 = perusat_2019_2.select(psbands_og);
+//creando una coleccion de imagenes
+var collection = ee.ImageCollection([ps1,ps2]);
+var mosaicps1 = collection.mosaic();
+print(mosaicps1, 'perusat new bands')
+Map.centerObject(mosaicps1, 10)
+Map.addLayer(mosaicps1, visParamsPS, 'perusat')
+//Map.addLayer(mosaicps1, {}, 'perusat', 1)
+
+var s2_1= s2.reproject('EPSG:4326', null,10);
+var ps_ = mosaicps1.reproject('EPSG:4326',null,10);
+//var comb = ee.Image.cat([s2_1,ps_]);
+//var comb_MS = comb.select(['b1','b2','b3','b4']);
+//print(comb_MS, 'combined image with all the bands');
+
+///////////////////////////////////////PSEUDO INVARIANT FEATURE MATCHING//////////////////////////////////////////////
+var bands = ee.List(['b1','b2','b3','b4']); //MATCHED BANDS
+print(bands, 'bands')
+var s2_pif = s2_1; //S2 mosaic from the same day, clipped over same area as perusat img, matched bands
+var ps_pif = ps_.register(s2_pif, 100);//*max displacement in meters
+print(ps_pif, 'after (ps pif)')
+Map.addLayer(ps_pif, {}, 'ps_pif', 0)
+//calculate spectral distance between two images
+var distance = s2_pif.spectralDistance(ps_pif, 'SID');
+Map.addLayer(distance, {min: 0, max: 0.4}, 'Spectral distance', 0); //gives image with one band, distance
+
+var geom = ps_pif.geometry();
+
+var threshold = distance.reduceRegion({reducer: ee.Reducer.percentile([5]), geometry:geom , scale: 10, bestEffort: true, maxPixels: 1e13,}).getNumber('distance');
+
+var pif = distance.lt(threshold);//self-mask?
+print(pif, 'pif')
+Map.addLayer(pif, {}, 'PIF mask', 0);
+
+
+function matchBand(band) {
+  var beforePif = s2_pif.select([band]).updateMask(pif);//focusing on invariant areas, iterating through the S2 bands I define
+  var afterPif = ps_pif.select([band]).updateMask(pif); //it's masking the Perusat bands I define 
+
+  var args = {reducer: ee.Reducer.linearFit(), geometry: geom, scale: 10, maxPixels: 1e13, bestEffort: true};
+
+  var coeffs = ee.Image.cat([afterPif, beforePif]).reduceRegion(args);
+
+  return ps_pif.select([band]).multiply(coeffs.getNumber('scale')).add(coeffs.getNumber('offset')).toUint16()
+  
+}
+
+//print(coeffs, 'coeffs')
+
+var matchedBands = bands.map(matchBand);//when I map the function over all bands and use generic "band" in the function, they don't match
+print(matchedBands, 'bands after function')
+var matched = ee.ImageCollection(matchedBands).toBands().rename(bands);
+print(matched, 'image collection of mapped bands after function')
+
+var viz = {min: 350, max: 1300, bands: ['b3','b2','b1']}
+
+Map.addLayer(s2_pif, viz, 's2 Before', 1);
+Map.addLayer(matched, viz, 'ps After (Matched)', 1);
+Map.addLayer(ps_pif, viz, 'ps After (Original)', 0);
+
+////////////////////////////Graph the spectral ranges before and after matching///////////////
+var comb_ = ee.Image.cat([s2_1,ps_]);
+var comb = comb_.select('b1', 'b2', 'b3', 'b4', 'b1_1', 'b2_1', 'b3_1', 'b4_1').rename('b1', 'b2', 'b3', 'b4', 'b1_PS', 'b2_PS', 'b3_PS', 'b4_PS')
+
+var chartStyle1 = {
+  title: ' Frequency (number of pixels with a band value in the bucket) Before',
+  colors: ['#0000FF','#89CFF0', '#2E8B57', '#93C572', '#D2042D', '#C04000', '#BF40BF', '#CCCCFF']
+};
+
+var chart_before = 
+   ui.Chart.image
+        .histogram({
+          image: comb, 
+          region: geom,
+          scale: 10,
+          maxPixels: 1e13
+      });
+
+chart_before.setOptions(chartStyle1);
+print(chart_before)
+
+///
+var comb_after = ee.Image.cat([s2_pif,matched]);
+var comb = comb_after.select('b1', 'b2', 'b3', 'b4', 'b1_1', 'b2_1', 'b3_1', 'b4_1').rename('b1', 'b2', 'b3', 'b4', 'b1_PS', 'b2_PS', 'b3_PS', 'b4_PS')
+
+var chartstyle2 = {
+  title: ' Frequency (number of pixels with a band value in the bucket) After',
+  colors: ['#0000FF','#89CFF0', '#2E8B57', '#93C572', '#D2042D', '#C04000', '#BF40BF', '#CCCCFF']
+}
+
+var chart_matched = 
+   ui.Chart.image
+        .histogram({
+          image: comb_after, 
+          region: geom,
+          scale: 10,
+          maxPixels: 1e13
+      });
+chart_matched.setOptions(chartstyle2);
+print(chart_matched)
