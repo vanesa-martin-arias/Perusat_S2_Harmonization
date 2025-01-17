@@ -1,0 +1,173 @@
+//normalizando histogramas - Histogram Matching, GEE Javascript
+//Map.centerObject(mosaicps1, 10)
+var visParams = {
+    bands: ['b3', 'b2', 'b1'], // RGB natural
+    min: 0,
+    max: 3000
+  };
+  
+//sentinel 2
+var s2_= ee.Image('projects/servir-sco-assets/assets/PeruSat-1_L8_L9_S2_Harmonization/s2img_2019')
+print(s2_, 's2_')
+var s2bands_og = ['B2','B3','B4','B8']
+var s2bands = ['b1','b2','b3','b4']
+var s2 = s2_.select(s2bands_og,s2bands)
+print(s2, 'Sentinel new bands')
+Map.addLayer(s2,visParams,'S2_20190908')
+//Perusat-1
+var visParamsPS = {
+    bands: ['b3', 'b2', 'b1'], // RGB natural
+    min: 0,
+    max: 3000
+  };
+  
+var perusat_2019_1 = ee.Image('projects/ee-perudeforestation/assets/ATCOR_ORTO_DIM_PER1_20190915151221_SEN_MS_000054')
+var perusat_2019_2 = ee.Image('projects/ee-perudeforestation/assets/ATCOR_ORTO_DIM_PER1_20190915151221_SEN_MS_000372')
+//var ps_ = ee.Image('projects/servir-sco-assets/assets/PeruSat-1_L8_L9_S2_Harmonization/PSH_DIM_PER1_20230922151914_SEN_P_009942-012')
+var psbands_og = ['b1','b2','b3','b4']
+var ps1 = perusat_2019_1.select(psbands_og);
+var ps2 = perusat_2019_2.select(psbands_og);
+//creando una coleccion de imagenes
+var collection = ee.ImageCollection([ps1,ps2]);
+var mosaicps1=collection.mosaic();
+print(mosaicps1, 'perusat new bands')
+Map.centerObject(mosaicps1, 10)
+Map.addLayer(mosaicps1, visParamsPS, 'perusat')
+//Map.addLayer(mosaicps1, {}, 'perusat', 1)
+
+////////////////////////////////////////combination OF BANDS before/////////////////////////////////////////////
+var s2_19 = s2.reproject('EPSG:4326', null, 10);
+var ps_ = mosaicps1.reproject('EPSG:4326', null, 10);
+var comb_ = ee.Image.cat([s2_19,ps_]);
+var comb = comb_.select('b1', 'b2', 'b3', 'b4', 'b1_1', 'b2_1', 'b3_1', 'b4_1').rename('b1', 'b2', 'b3', 'b4', 'b1_PS', 'b2_PS', 'b3_PS', 'b4_PS')
+print(comb, 'combined image with all the bands');
+
+var chartStyle = {
+  title: ' Frequency (number of pixels with a band value in the bucket)',
+  colors: ['#0000FF','#89CFF0', '#2E8B57', '#93C572', '#D2042D', '#C04000', '#BF40BF', '#CCCCFF']
+};
+
+var chart = 
+   ui.Chart.image
+        .histogram({
+          image: comb, 
+          scale: 10,
+          maxPixels: 1e13
+      });
+
+chart.setOptions(chartStyle);
+print(chart)
+///////////////////////////////////////HISTOGRAM MATCHING//////////////////////////////////////////////
+var bands = ['b1','b2','b3','b4']
+var image1 = s2_19
+var image2 = ps_
+print(image2)
+
+// Get a FeatureCollection representation of a cumulative distribution function built from a histogram.  The returned FeatureCollection
+// can be used to train a classifer.
+//FUNCTION
+var imaggeometry = comb.geometry();
+
+var getFC = function(image, band) {
+  // Histogram equalization start:
+  var histo = image.reduceRegion({
+    reducer: ee.Reducer.histogram({
+      maxBuckets: Math.pow(2, 12), 
+      minBucketWidth: 16, 
+      // maxRaw: 
+    }), 
+    geometry: imaggeometry,//image.geometry(), 
+    scale: 2, 
+    maxPixels: 1e12, 
+    tileScale: 8
+  });
+  //print(histo);
+  
+  var valsList = ee.List(ee.Dictionary(histo.get(band)).get('bucketMeans'));
+  var freqsList = ee.List(ee.Dictionary(histo.get(band)).get('histogram'));
+  var cdfArray = ee.Array(freqsList).accum(0);
+  var total = cdfArray.get([-1]);
+  var normalizedCdf = cdfArray.divide(total);
+  
+  // var chart = Chart.array.values(normalizedCdf, 0, valsList);
+  // print(chart); // OK
+  
+  var array = ee.Array.cat([valsList, normalizedCdf], 1);
+
+  return ee.FeatureCollection(array.toList().map(function(list) {
+    return ee.Feature(null, {
+      dn: ee.List(list).get(0), 
+      probability: ee.List(list).get(1)});
+  }));
+};
+
+//FUNCTION
+// Equalize a given band between two images.  Image1 is golden.
+var equalize = function(image1, image2, band) {
+  var fc1 = getFC(image1, band);
+  var fc2 = getFC(image2, band);
+      
+  var classifier1 = ee.Classifier.smileRandomForest(100)
+    .setOutputMode('REGRESSION')
+    .train({
+      features: fc1, 
+      classProperty: 'dn', 
+      inputProperties: ['probability']
+  });
+// var test = fc1.classify(classifier1);
+  // var testChart = comb.feature.byFeature(test, 'probability', ['dn', 'classification']);
+  // print(testChart); // OK
+  
+  var classifier2 = ee.Classifier.smileRandomForest(100)
+  .setOutputMode('REGRESSION')
+  .train({
+    features: fc2, 
+    classProperty: 'probability', 
+    inputProperties: ['dn']
+  });
+
+  // Do the shuffle: DN -> probability -> DN. Return the result.
+  var b = image2.select(band).rename('dn');
+  return b
+    .classify(classifier2, 'probability') // DN -> probability
+    .classify(classifier1, band); // probability -> DN
+};
+
+// Map the matching function over each band.
+var match = function(image1, image2) {
+  return ee.Image.cat(bands.map(function(band) {
+    return equalize(image1, image2, band);
+  }));
+};
+
+var matched = match(image1, image2);
+
+//Map.centerObject(image1);
+Map.addLayer(image1, {bands: ['b3','b2','b1'], min:200, max:4000},'img-default-s2');
+Map.addLayer(image2, {bands: ['b3','b2','b1'], min:200, max:4000},'to be matched-ps');
+Map.addLayer(matched, {bands: ['b3','b2','b1'], min:200, max:4000}, 'matched');
+print(matched, 'matched')
+//////////////////////chart of bands after 
+var image_s2 = image1.reproject('EPSG:4326', null, 10);
+var ps_matched = matched.reproject('EPSG:4326', null, 10);
+
+var comb_m = ee.Image.cat([image_s2, ps_matched]);
+var comb_mb = comb_m.select('b1', 'b2', 'b3', 'b4', 'b1_1', 'b2_1', 'b3_1', 'b4_1').rename('b1', 'b2', 'b3', 'b4', 'b1_PS', 'b2_PS', 'b3_PS', 'b4_PS')
+print(comb_mb, 'combined image with all the bands');
+
+var chartStyle1 = {
+  title: ' Frequency (number of pixels with a band value in the bucket) after matching',
+  colors: ['#0000FF','#89CFF0', '#2E8B57', '#93C572', '#D2042D', '#C04000', '#BF40BF', '#CCCCFF']
+};
+
+var chart1 = 
+   ui.Chart.image
+        .histogram({
+          image: comb_mb, 
+          region: imaggeometry,
+          scale: 10,
+          maxPixels: 1e13
+      });
+
+chart1.setOptions(chartStyle1);
+print(chart1)
